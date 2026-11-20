@@ -1,0 +1,34 @@
+# Build outputs (the build happens inside external/; nothing is built in plugin/ or engine/)
+/plugin/build/
+/plugin/lib/
+/plugin/dist/
+/engine/chimera-mpc/target/
+target/
+*.exe
+*.pdb
+*.dll
+*.so
+*.dylib
+*.a
+*.o
+*.obj
+*.zip
+
+# Copied in by the build from the engine's data (see plugin/build_engine.py)
+/plugin/Content/*.gz
+/plugin/Content/*-LICENSE.txt
+
+# Python / editors / OS
+__pycache__/
+*.pyc
+.venv/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local notes and tool state that must never be published
+.claude/
+*.jsonl
+.env
+*.local.*

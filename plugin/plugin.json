@@ -1,0 +1,17 @@
+{
+  "name": "Chimera Voice",
+  "manufacturer": "Gator Audio",
+  "version": "1.3.3",
+  "format": "vst2",
+  "kind": "instrument",
+  "uid": "Geqk",
+  "numInputs": 0,
+  "numOutputs": 2,
+  "category": "Synth",
+  "file32": "VST/chimera-voice-arm32.so",
+  "file64": "VST/chimera-voice-arm64.so",
+  "description": "Chimera Voice: a 4-voice synth for the MPC. Describe your plugin here.",
+  "author": "Gator Audio",
+  "url": "",
+  "license": "MIT"
+}

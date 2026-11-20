@@ -1,0 +1,7 @@
+# Keep sources byte-identical to the released build on every platform
+* text=auto eol=lf
+*.patch -text
+*.png binary
+*.gz binary
+*.zip binary
+*.bat text eol=crlf

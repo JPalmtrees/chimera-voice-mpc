@@ -1,0 +1,119 @@
+diff --git a/framework/mpc_plugin.h b/framework/mpc_plugin.h
+index dbf239b..893dea9 100644
+--- a/framework/mpc_plugin.h
++++ b/framework/mpc_plugin.h
+@@ -510,9 +510,14 @@ public:
+         return out;
+     }
+ 
++    // True while a saved state or a program is being applied (parameterChanged() calls made then
++    // are restores, not user gestures). Read it from parameterChanged().
++    bool restoringState() const { return restoring_; }
++
+     bool internalLoadState(const uint8_t* data, size_t size)
+     {
+         if (data == nullptr || size < 12 || std::memcmp(data, "MPCP", 4) != 0) return false;
++        struct Restoring { bool& f; explicit Restoring(bool& r) : f(r) { f = true; } ~Restoring() { f = false; } } restoring(restoring_);
+         size_t pos = 4;
+         auto getU32 = [&](uint32_t& v) { if (pos + 4 > size) return false; v = 0; for (int i = 0; i < 4; ++i) v |= (uint32_t)data[pos + (size_t)i] << (8 * i); pos += 4; return true; };
+         uint32_t version = 0, n = 0;
+@@ -555,8 +560,10 @@ public:
+     {
+         if (programs_.empty() || i < 0 || i >= (int)programs_.size()) return;
+         currentProgram_ = i;
++        restoring_ = true;
+         const Program& p = programs_[(size_t)i];
+         for (int k = 0; k < numParams() && k < (int)p.plainValues.size(); ++k) set(k, p.plainValues[(size_t)k]);
++        restoring_ = false;
+         stateLoadPending_.store(true, std::memory_order_release);
+     }
+ 
+@@ -617,7 +624,8 @@ protected:
+ 
+     PluginInfo info_;
+     std::vector<Param> params_;
+-    std::vector<std::atomic<float>*> values_;   // heap-allocated so the vector can grow during construction
++    std::vector<std::atomic<float>*> values_;
++    bool restoring_ = false;   // heap-allocated so the vector can grow during construction
+     std::vector<Program> programs_;
+     int currentProgram_ = 0;
+     double sampleRate_ = 44100.0;
+diff --git a/tools/build.py b/tools/build.py
+index cdbbe32..162af11 100644
+--- a/tools/build.py
++++ b/tools/build.py
+@@ -377,6 +377,26 @@ class Builder:
+             flags.append("-D" + d)
+         return flags
+ 
++    def extra_link(self, target):
++        """Prebuilt libraries and linker flags for one target, from the project's optional link.json:
++        {"arm32": ["lib/arm32/libfoo.a", "-lpthread"], "arm64": [...], "native": [...], "desktop": [...]}.
++        Paths are relative to the project; entries starting with '-' are passed as they are."""
++        path = os.path.join(self.project, "link.json")
++        if not os.path.isfile(path):
++            return []
++        with open(path, encoding="utf-8") as fh:
++            spec = json.load(fh)
++        out = []
++        for e in spec.get(target, []):
++            if e.startswith("-"):
++                out.append(e)
++            else:
++                f = os.path.normpath(os.path.join(self.project, e))
++                if not os.path.isfile(f):
++                    raise BuildError("link.json (%s): %s not found. Build it first (see the project's README)." % (target, f))
++                out.append(f)
++        return out
++
+     def link_flags_arm(self):
+         flags = ["-Wl,--gc-sections"]
+         if not self.args.debug:
+@@ -408,7 +428,7 @@ class Builder:
+     def build_native(self, output):
+         flags = self.common_flags()
+         if self.toolchain == "zig":
+-            argv = self.zig + ["c++"] + flags + native_target_flags_for_zig() + ["-o", output] + self.sources
++            argv = self.zig + ["c++"] + flags + native_target_flags_for_zig() + ["-o", output] + self.sources + self.extra_link("native")
+         else:
+             if not self.system_cxx:
+                 warn("no native C++ compiler found (c++/g++/clang++); skipping the native build and host_sim.\n"
+@@ -472,7 +492,7 @@ class Builder:
+                 argv = self.zig + ["c++"] + flags + native_target_flags_for_zig()
+                 if self.version_script_ok and not IS_WINDOWS:
+                     argv.append("-Wl,--version-script=" + EXPORTS_MAP)
+-                argv += ["-o", binary] + self.sources
++                argv += ["-o", binary] + self.sources + self.extra_link("desktop")
+             else:
+                 if not self.system_cxx:
+                     raise BuildError("no C++ compiler found for the desktop build (install g++ or use the default zig toolchain)")
+@@ -525,9 +545,9 @@ class Builder:
+         if self.version_script_ok:
+             flags.append("-Wl,--version-script=" + EXPORTS_MAP)
+         if self.toolchain == "zig":
+-            argv = self.zig + ["c++"] + flags + ["-target", zig_target, "-mcpu=" + zig_cpu, "-o", output] + self.sources
++            argv = self.zig + ["c++"] + flags + ["-target", zig_target, "-mcpu=" + zig_cpu, "-o", output] + self.sources + self.extra_link(target)
+         else:
+-            argv = [gcc] + flags + gcc_arch + ["-static-libstdc++", "-static-libgcc", "-o", output] + self.sources
++            argv = [gcc] + flags + gcc_arch + ["-static-libstdc++", "-static-libgcc", "-o", output] + self.sources + self.extra_link(target)
+             if self.toolchain == "docker":
+                 self.docker.ensure_image()
+                 argv = self.docker.wrap(argv)
+@@ -726,6 +746,17 @@ def make_skins(project, out_dir, params_json, no_ui):
+         else:
+             warn("assets/ was not copied because there is no Plugin Skins folder to put it in")
+ 
++    # optional project hook: skins_post.py <Plugin Skins dir> <params.json> adds to the generated
++    # skins (e.g. a hand-built page the ui.json generator cannot express)
++    post = os.path.join(project, "skins_post.py")
++    if os.path.isfile(post) and os.path.isfile(os.path.join(skins_out, "TUI.json")):
++        code, out = run([sys.executable, post, skins_out, params_json])
++        if out.strip():
++            log(out.rstrip())
++        if code != 0:
++            raise BuildError("skins_post.py failed (exit code %d)" % code)
++        log("  skins_post.py -> Plugin Skins/")
++
+     return os.path.isfile(os.path.join(skins_out, "TUI.json"))
+ 
+ 

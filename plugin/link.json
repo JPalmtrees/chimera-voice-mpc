@@ -1,0 +1,6 @@
+{
+  "arm32": ["lib/arm32/libchimera_mpc.a", "-lpthread", "-ldl", "-lm"],
+  "arm64": ["lib/arm64/libchimera_mpc.a", "-lpthread", "-ldl", "-lm"],
+  "native": ["lib/native/libchimera_mpc.a", "-lws2_32", "-luserenv", "-lbcrypt", "-lntdll", "-ladvapi32", "-lkernel32", "-lapi-ms-win-core-synch-l1-2-0"],
+  "desktop": ["lib/native/libchimera_mpc.a", "-lws2_32", "-luserenv", "-lbcrypt", "-lntdll", "-ladvapi32", "-lkernel32", "-lapi-ms-win-core-synch-l1-2-0"]
+}

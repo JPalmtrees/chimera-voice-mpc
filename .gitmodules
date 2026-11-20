@@ -1,0 +1,8 @@
+[submodule "external/chimera-vocal-synth"]
+	path = external/chimera-vocal-synth
+	url = https://github.com/jamesondh/chimera-vocal-synth.git
+	ignore = dirty
+[submodule "external/mpc-plugin-builder-sdk"]
+	path = external/mpc-plugin-builder-sdk
+	url = https://github.com/inmusic-software/mpc-plugin-builder-sdk.git
+	ignore = dirty

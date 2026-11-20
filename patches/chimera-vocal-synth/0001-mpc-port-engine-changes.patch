@@ -1,0 +1,727 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 604bbe1..7a3480d 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -34,6 +34,15 @@ dependencies = [
+  "serde_json",
+ ]
+ 
++[[package]]
++name = "chimera-mpc"
++version = "0.1.0"
++dependencies = [
++ "chimera",
++ "flate2",
++ "serde_json",
++]
++
+ [[package]]
+ name = "chimera-wasm"
+ version = "0.1.0"
+diff --git a/Cargo.toml b/Cargo.toml
+index f14137a..6e24868 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,6 +1,6 @@
+ [workspace]
+ resolver = "3"
+-members = ["crates/chimera", "crates/chimera-wasm", "crates/chimera-cli"]
++members = ["crates/chimera", "crates/chimera-wasm", "crates/chimera-cli", "crates/chimera-mpc"]
+ 
+ [workspace.package]
+ version = "0.1.0"
+diff --git a/crates/chimera/src/airway/network.rs b/crates/chimera/src/airway/network.rs
+index e8cc693..e31a215 100644
+--- a/crates/chimera/src/airway/network.rs
++++ b/crates/chimera/src/airway/network.rs
+@@ -341,6 +341,46 @@ pub struct AirwayNetwork {
+     pub noise_scale: f64,
+     /// last output sample (radiated pressure derivative)
+     pub out: f64,
++
++    // --- work saved on still geometry (bit-exact) and opt-in fast arithmetic ---
++    /// the node's geometry moved this sample (its derived values were recomputed)
++    node_moved: Vec<bool>,
++    /// recompute every node's and branch's geometry on the next step (after a jump or a reset)
++    geo_fresh: bool,
++    /// the parameters the branch cache was computed with: viscosity, closure, symmetric kinetic
++    cache_key: (f64, f64, bool),
++    /// a series branch's coefficients from when its nodes last moved: L, R, kf, kb, A_eff, closed
++    bc_l: Vec<f64>,
++    bc_r: Vec<f64>,
++    bc_kf: Vec<f64>,
++    bc_kb: Vec<f64>,
++    bc_aeff: Vec<f64>,
++    bc_closed: Vec<bool>,
++    /// a radiating node's load, and the area it was computed for
++    rc_area: Vec<f64>,
++    rc_lr: Vec<f64>,
++    rc_rr: Vec<f64>,
++    /// a node's last compliance C and T/C (the division is redone only when C changes)
++    c_memo: Vec<f64>,
++    tc_memo: Vec<f64>,
++    /// Faster arithmetic for slow FPUs (the MPC's Cortex-A17, where a divide or square root costs
++    /// about 30 multiplies): within a control block, moving sections update 1/A, 1/A_min and sqrt(A)
++    /// by one Newton step from the previous sample's values (exact again at each block start, and
++    /// whenever the step is not small), walls multiply by a precomputed reciprocal, and a branch
++    /// with linear losses multiplies by 1/(L/T + R). Relative differences ~1e-7 in the
++    /// coefficients, none in the equations. Off by default: the golden fixtures are the exact path.
++    /// Also (the per-sample divides and square roots, ~150 a sample, each stalling the A17's FPU):
++    /// a node's compliance multiplies by 1/ρc², its T/C and each branch's 1/(L/T + R) take one
++    /// Newton step from the previous sample's (exact when the step is not small), and the kinetic
++    /// loss's quadratic, u = (c/bq)·2/(1 + √(1 + x)) with x = 4k|c|/bq², uses its series for
++    /// x < 0.01 (relative error < 5e-12), as it is in open sections of the tract.
++    pub fast_math: bool,
++    exact_next: bool,
++    wall_a: Vec<f64>,
++    wall_inv_d: Vec<f64>,
++    inv_rsqrt: Vec<f64>,
++    /// fast_math: a branch's 1/(L/T + R), Newton-updated from the previous sample's
++    inv_bq: Vec<f64>,
+ }
+ 
+ impl AirwayNetwork {
+@@ -434,6 +474,26 @@ impl AirwayNetwork {
+             viscous_omega: 2.0 * PI * 700.0,
+             noise_scale: 1.0,
+             out: 0.0,
++            node_moved: Vec::new(),
++            geo_fresh: true,
++            cache_key: (f64::NAN, f64::NAN, false),
++            bc_l: Vec::new(),
++            bc_r: Vec::new(),
++            bc_kf: Vec::new(),
++            bc_kb: Vec::new(),
++            bc_aeff: Vec::new(),
++            bc_closed: Vec::new(),
++            rc_area: Vec::new(),
++            rc_lr: Vec::new(),
++            rc_rr: Vec::new(),
++            c_memo: Vec::new(),
++            tc_memo: Vec::new(),
++            fast_math: false,
++            exact_next: true,
++            wall_a: Vec::new(),
++            wall_inv_d: Vec::new(),
++            inv_rsqrt: Vec::new(),
++            inv_bq: Vec::new(),
+         }
+     }
+ 
+@@ -627,6 +687,23 @@ impl AirwayNetwork {
+             self.vol[k] = a * self.dx[k];
+             self.inv_a[k] = 1.0 / js_max(self.area[k], 1e-6);
+         }
++        self.node_moved = vec![true; n];
++        self.bc_l = zf(b);
++        self.bc_r = zf(b);
++        self.bc_kf = zf(b);
++        self.bc_kb = zf(b);
++        self.bc_aeff = zf(b);
++        self.bc_closed = vec![false; b];
++        self.rc_area = vec![f64::NAN; nr];
++        self.rc_lr = zf(nr);
++        self.rc_rr = zf(nr);
++        self.c_memo = vec![f64::NAN; n];
++        self.tc_memo = zf(n);
++        self.wall_a = (0..n).map(|k| self.wall_m[k] * self.inv_t - 0.5 * self.wall_r[k]).collect();
++        self.wall_inv_d = (0..n).map(|k| 1.0 / (self.wall_m[k] * self.inv_t + 0.5 * self.wall_r[k])).collect();
++        self.inv_rsqrt = zf(n);
++        self.inv_bq = zf(b);
++        self.geo_fresh = true;
+         self.check_cfl();
+     }
+ 
+@@ -696,6 +773,7 @@ impl AirwayNetwork {
+             self.amin_step[k] = 0.0;
+             self.dx_step[k] = 0.0;
+         }
++        self.geo_fresh = true;
+         for j in 0..self.n_branches {
+             if self.b_kind[j] == KIND_PORT {
+                 self.port_area[j] = self.port_area_target[j];
+@@ -735,6 +813,7 @@ impl AirwayNetwork {
+             }
+         }
+         self.flush_tiny();
++        self.exact_next = true;
+     }
+ 
+     /// How many of the states `flush_tiny` looks after are denormal (for tests: none should be).
+@@ -839,6 +918,8 @@ impl AirwayNetwork {
+         //    the split keeps mass conserved.
+         let sq = self.squeeze_area;
+         let vol_on = self.enable_volume_source;
++        let fast_step = self.fast_math && !self.exact_next;
++        let fast_math = self.fast_math;
+         if vol_on {
+             self.spill.fill(0.0);
+         }
+@@ -847,7 +928,23 @@ impl AirwayNetwork {
+             let amin = &mut self.amin;
+             let dx = &mut self.dx;
+             let inj = &mut self.spill; // the per-node raw injection accumulator
++            let key = (self.viscous_scale * self.viscous_omega, self.closed_area, self.symmetric_kinetic);
++            let fresh = self.geo_fresh || key != self.cache_key;
++            self.geo_fresh = false;
++            self.cache_key = key;
++            let fast = self.fast_math && !self.exact_next;
++            self.exact_next = false;
+             for k in 0..n {
++                self.inv_lsum[k] = 0.0;
++                self.flow_sum[k] = self.ext_flow[k];
++                self.ext_flow[k] = 0.0;
++                // still geometry: area, minimum and length stay put, and so does everything derived
++                // from them (and the volume, so no wall-movement source): skip it all
++                let moving = fresh || self.area_step[k] != 0.0 || self.amin_step[k] != 0.0 || self.dx_step[k] != 0.0;
++                self.node_moved[k] = moving;
++                if !moving {
++                    continue;
++                }
+                 let mut a = area[k] + self.area_step[k];
+                 if a < 0.0 {
+                     a = 0.0;
+@@ -861,10 +958,25 @@ impl AirwayNetwork {
+                 amin[k] = amk;
+                 dx[k] += self.dx_step[k];
+                 let d = dx[k];
+-                let ia = 1.0 / (if a > 1e-6 { a } else { 1e-6 });
++                let r0 = self.inv_rsqrt[k];
++                let e = a * r0 * r0;
++                let (ia, sa) = if fast && a > 1e-6 && e > 0.999 && e < 1.001 {
++                    // r = 1/sqrt(a) from the last sample, one Newton step: 1/a = r², sqrt(a) = a·r
++                    let r = r0 * (1.5 - 0.5 * e);
++                    self.inv_rsqrt[k] = r;
++                    (r * r, a * r)
++                } else {
++                    let ia = 1.0 / (if a > 1e-6 { a } else { 1e-6 });
++                    let sa = sqrt(a);
++                    if self.fast_math {
++                        self.inv_rsqrt[k] = if a > 1e-6 { 1.0 / sa } else { 0.0 };
++                    }
++                    (ia, sa)
++                };
+                 self.inv_a[k] = ia;
+-                self.inv_amin[k] = 1.0 / (if amk > 1e-6 { amk } else { 1e-6 });
+-                let sa = sqrt(a);
++                let im0 = self.inv_amin[k];
++                let em = amk * im0;
++                self.inv_amin[k] = if fast && amk > 1e-6 && em > 0.999 && em < 1.001 { im0 * (2.0 - em) } else { 1.0 / (if amk > 1e-6 { amk } else { 1e-6 }) };
+                 self.sqrt_a[k] = sa;
+                 self.half_l[k] = d * ia;
+                 self.half_r[k] = self.wall_perim[k] * d * sa * ia * ia * self.visc_f[k];
+@@ -899,9 +1011,6 @@ impl AirwayNetwork {
+                     }
+                 }
+                 self.vol[k] = v;
+-                self.inv_lsum[k] = 0.0;
+-                self.flow_sum[k] = self.ext_flow[k];
+-                self.ext_flow[k] = 0.0;
+             }
+         }
+         if vol_on {
+@@ -944,6 +1053,9 @@ impl AirwayNetwork {
+             let branch_area = &mut self.branch_area[..nb];
+             let port_area = &mut self.port_area[..nb];
+             let (port_area_step, port_len, port_half, port_slit, port_extra_r, port_kin, port_kex) = (&self.port_area_step[..nb], &self.port_len[..nb], &self.port_half[..nb], &self.port_slit[..nb], &self.port_extra_r[..nb], &self.port_kin[..nb], &self.port_kex[..nb]);
++            let moved = &self.node_moved[..n];
++            let (bc_l, bc_r, bc_kf, bc_kb, bc_aeff, bc_closed) = (&mut self.bc_l[..nb], &mut self.bc_r[..nb], &mut self.bc_kf[..nb], &mut self.bc_kb[..nb], &mut self.bc_aeff[..nb], &mut self.bc_closed[..nb]);
++            let inv_bq = &mut self.inv_bq[..nb];
+             for j in 0..nb {
+                 let a = b_a[j];
+                 let b = b_b[j];
+@@ -952,18 +1064,34 @@ impl AirwayNetwork {
+                 let mut kf: f64;
+                 let mut kb: f64;
+                 let a_eff: f64;
+-                if b_kind[j] == KIND_SERIES {
++                if b_kind[j] == KIND_SERIES && !moved[a] && !moved[b] {
++                    // neither node moved: the coefficients are the ones computed when they last did
++                    a_eff = bc_aeff[j];
++                    if bc_closed[j] {
++                        u_arr[j] = 0.0;
++                        mom[j] = 0.0;
++                        branch_area[j] = a_eff;
++                        continue;
++                    }
++                    l = bc_l[j];
++                    r = bc_r[j];
++                    kf = bc_kf[j];
++                    kb = bc_kb[j];
++                } else if b_kind[j] == KIND_SERIES {
+                     let aa = area[a];
+                     let ab = area[b];
+                     let ma = amin[a];
+                     let mb = amin[b];
+                     a_eff = if ma < mb { ma } else { mb };
++                    bc_aeff[j] = a_eff;
+                     if (if aa < ab { aa } else { ab }) < closed || a_eff < closed {
++                        bc_closed[j] = true;
+                         u_arr[j] = 0.0;
+                         mom[j] = 0.0;
+                         branch_area[j] = a_eff;
+                         continue;
+                     }
++                    bc_closed[j] = false;
+                     let ia = inv_a[a];
+                     let ib = inv_a[b];
+                     l = half_rho * (half_l[a] + half_l[b]);
+@@ -986,6 +1114,10 @@ impl AirwayNetwork {
+                     if cb > 0.0 {
+                         kb += 0.1 * half_rho * cb * cb;
+                     }
++                    bc_l[j] = l;
++                    bc_r[j] = r;
++                    bc_kf[j] = kf;
++                    bc_kb[j] = kb;
+                 } else {
+                     port_area[j] += port_area_step[j];
+                     let mut ap = port_area[j];
+@@ -1030,12 +1162,32 @@ impl AirwayNetwork {
+                 let m0 = if enable_energy_safe && l < lp { l * u_arr[j] } else { mom[j] };
+                 let c = p[a] - p[b] + psrc[j] + m0 * inv_t;
+                 let bq = l * inv_t + r;
+-                let u = if c >= 0.0 {
+-                    if kf > 0.0 { (2.0 * c) / (bq + sqrt(bq * bq + 4.0 * kf * c)) } else { c / bq }
+-                } else if kb > 0.0 {
+-                    (2.0 * c) / (bq + sqrt(bq * bq - 4.0 * kb * c))
++                let u = if fast_step {
++                    let e = bq * inv_bq[j];
++                    let ib = if e > 0.999 && e < 1.001 { inv_bq[j] * (2.0 - e) } else { 1.0 / bq };
++                    inv_bq[j] = ib;
++                    let k = if c >= 0.0 { kf } else { kb };
++                    let q = c * ib;
++                    let x = 4.0 * k * c.abs() * ib * ib;
++                    if k <= 0.0 {
++                        q
++                    } else if x < 0.01 {
++                        // 2/(1 + √(1 + x)) = Σ Catalan(n)·(−x/4)ⁿ
++                        q * (1.0 - x * (0.25 - x * (0.125 - x * (0.078125 - x * 0.0546875))))
++                    } else {
++                        (2.0 * c) / (bq + sqrt(bq * bq + 4.0 * k * c.abs()))
++                    }
+                 } else {
+-                    c / bq
++                    if fast_math {
++                        inv_bq[j] = 1.0 / bq;
++                    }
++                    if c >= 0.0 {
++                        if kf > 0.0 { (2.0 * c) / (bq + sqrt(bq * bq + 4.0 * kf * c)) } else { c / bq }
++                    } else if kb > 0.0 {
++                        (2.0 * c) / (bq + sqrt(bq * bq - 4.0 * kb * c))
++                    } else {
++                        c / bq
++                    }
+                 };
+                 u_arr[j] = u;
+                 mom[j] = l * u;
+@@ -1056,9 +1208,13 @@ impl AirwayNetwork {
+             if !self.has_wall[k] {
+                 continue;
+             }
+-            let m = self.wall_m[k];
+-            let r = self.wall_r[k];
+-            let v = ((m * inv_t - 0.5 * r) * self.wall_v[k] + self.p[k] - self.wall_k[k] * self.wall_y[k]) / (m * inv_t + 0.5 * r);
++            let v = if self.fast_math {
++                (self.wall_a[k] * self.wall_v[k] + self.p[k] - self.wall_k[k] * self.wall_y[k]) * self.wall_inv_d[k]
++            } else {
++                let m = self.wall_m[k];
++                let r = self.wall_r[k];
++                ((m * inv_t - 0.5 * r) * self.wall_v[k] + self.p[k] - self.wall_k[k] * self.wall_y[k]) / (m * inv_t + 0.5 * r)
++            };
+             self.wall_v[k] = v;
+             self.wall_y[k] += t * v;
+             let sa = if self.area[k] > min_a { self.sqrt_a[k] } else { sqrt(min_a) };
+@@ -1108,7 +1264,7 @@ impl AirwayNetwork {
+                 }
+                 continue;
+             }
+-            let mut c = self.vol[k] / RHO_C2;
++            let mut c = if fast_step { self.vol[k] * (1.0 / RHO_C2) } else { self.vol[k] / RHO_C2 };
+             // junction stability: local breathing mode ω² ≈ ΣL⁻¹/C must satisfy T²ω² ≤ 2.4
+             if self.is_junction[k] && self.enable_junction_floor {
+                 let c_min = (t2 * self.inv_lsum[k]) / 2.4;
+@@ -1118,12 +1274,22 @@ impl AirwayNetwork {
+             }
+             let r = self.rad_of[k];
+             if r < 0 {
+-                self.p[k] += (t / c) * self.flow_sum[k];
++                // T/C, divided again only when C has changed (bit-exact)
++                if c != self.c_memo[k] {
++                    self.c_memo[k] = c;
++                    let e = if fast_step { c * self.tc_memo[k] * inv_t } else { 0.0 };
++                    self.tc_memo[k] = if e > 0.999 && e < 1.001 { self.tc_memo[k] * (2.0 - e) } else { t / c };
++                }
++                self.p[k] += self.tc_memo[k] * self.flow_sum[k];
+             } else {
+                 let r = r as usize;
+                 let a = if self.area[k] > 1e-4 { self.area[k] } else { 1e-4 };
+-                let lr = (8.0 * RHO) / (3.0 * PI * sqrt(PI * a));
+-                let rr = (128.0 * RHO * C_SOUND) / (9.0 * PI * PI * a);
++                if a != self.rc_area[r] {
++                    self.rc_area[r] = a;
++                    self.rc_lr[r] = (8.0 * RHO) / (3.0 * PI * sqrt(PI * a));
++                    self.rc_rr[r] = (128.0 * RHO * C_SOUND) / (9.0 * PI * PI * a);
++                }
++                let (lr, rr) = (self.rc_lr[r], self.rc_rr[r]);
+                 let p_old = self.p[k];
+                 // energy-safe: when the radiation inertance grows (aperture closing) conserve momentum
+                 let lp = self.rad_l_prev[r];
+@@ -1273,5 +1439,6 @@ impl AirwayNetwork {
+         self.rad_ul.fill(0.0);
+         self.rad_l_prev.fill(0.0);
+         self.rad_prev_total = 0.0;
++        self.geo_fresh = true;
+     }
+ }
+diff --git a/crates/chimera/src/anatomy/geom.rs b/crates/chimera/src/anatomy/geom.rs
+index 9904db9..873d4cc 100644
+--- a/crates/chimera/src/anatomy/geom.rs
++++ b/crates/chimera/src/anatomy/geom.rs
+@@ -107,28 +107,35 @@ impl Polyline {
+ pub fn ray_polyline(ox: f64, oy: f64, dx: f64, dy: f64, pl: &Polyline, t_min: f64, t_max: f64, out: &mut [f64]) -> usize {
+     let mut n = 0;
+     let (xs, ys) = (&pl.xs, &pl.ys);
++    // each vertex's side of the line is worked out once (it is both ends' of two segments)
++    let mut sa = xs.first().is_some_and(|&x| side(ox, oy, dx, dy, x, ys[0]));
+     for i in 0..xs.len().saturating_sub(1) {
+-        let t = crossing_t(ox, oy, dx, dy, xs[i], ys[i], xs[i + 1], ys[i + 1]);
+-        if t >= t_min && t <= t_max && n < out.len() {
+-            out[n] = t;
+-            n += 1;
++        let sb = side(ox, oy, dx, dy, xs[i + 1], ys[i + 1]);
++        if sa != sb {
++            let t = crossing_at(ox, oy, dx, dy, xs[i], ys[i], xs[i + 1], ys[i + 1]);
++            if t >= t_min && t <= t_max && n < out.len() {
++                out[n] = t;
++                n += 1;
++            }
+         }
++        sa = sb;
+     }
+     n
+ }
+ 
+-/// Where segment A→B crosses the line through o along d (as t along d), or NaN. A segment
+-/// crosses only if its ends lie on different sides of the line, a point on the line counting as
+-/// the positive side: a polyline passing through a vertex then crosses once, and one that only
+-/// touches the line at a vertex crosses twice at the same t or not at all.
++/// The side of the line through o along d that a point is on. A segment crosses the line only if
++/// its ends lie on different sides, a point on the line counting as the positive side: a polyline
++/// passing through a vertex then crosses once, and one that only touches the line at a vertex
++/// crosses twice at the same t or not at all.
++#[inline(always)]
++fn side(ox: f64, oy: f64, dx: f64, dy: f64, x: f64, y: f64) -> bool {
++    dx * (y - oy) - dy * (x - ox) >= 0.0
++}
++
++/// Where segment A→B, its ends on different sides, crosses the line (as t along d), or NaN.
+ #[allow(clippy::too_many_arguments)]
+-#[inline]
+-fn crossing_t(ox: f64, oy: f64, dx: f64, dy: f64, ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
+-    let sa = dx * (ay - oy) - dy * (ax - ox) >= 0.0;
+-    let sb = dx * (by - oy) - dy * (bx - ox) >= 0.0;
+-    if sa == sb {
+-        return f64::NAN;
+-    }
++#[inline(always)]
++fn crossing_at(ox: f64, oy: f64, dx: f64, dy: f64, ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
+     let ex = bx - ax;
+     let ey = by - ay;
+     let den = dx * ey - dy * ex;
+@@ -144,14 +151,19 @@ fn crossing_t(ox: f64, oy: f64, dx: f64, dy: f64, ax: f64, ay: f64, bx: f64, by:
+ pub fn ray_crossings(ox: f64, oy: f64, dx: f64, dy: f64, pl: &Polyline, t_min: f64, t_max: f64, out_t: &mut [f64], exit: &mut [bool]) -> usize {
+     let mut n = 0;
+     let (xs, ys) = (&pl.xs, &pl.ys);
++    let mut sa = xs.first().is_some_and(|&x| side(ox, oy, dx, dy, x, ys[0]));
+     for i in 0..xs.len().saturating_sub(1) {
+-        let t = crossing_t(ox, oy, dx, dy, xs[i], ys[i], xs[i + 1], ys[i + 1]);
+-        if t >= t_min && t <= t_max && n < out_t.len() {
+-            out_t[n] = t;
+-            // leaving the tissue (on the polyline's right) for the air: the ray turns left across it
+-            exit[n] = dx * (ys[i + 1] - ys[i]) - dy * (xs[i + 1] - xs[i]) < 0.0;
+-            n += 1;
++        let sb = side(ox, oy, dx, dy, xs[i + 1], ys[i + 1]);
++        if sa != sb {
++            let t = crossing_at(ox, oy, dx, dy, xs[i], ys[i], xs[i + 1], ys[i + 1]);
++            if t >= t_min && t <= t_max && n < out_t.len() {
++                out_t[n] = t;
++                // leaving the tissue (on the polyline's right) for the air: the ray turns left across it
++                exit[n] = dx * (ys[i + 1] - ys[i]) - dy * (xs[i + 1] - xs[i]) < 0.0;
++                n += 1;
++            }
+         }
++        sa = sb;
+     }
+     n
+ }
+diff --git a/crates/chimera/src/anatomy/human.rs b/crates/chimera/src/anatomy/human.rs
+index 0ce85a5..92179e9 100644
+--- a/crates/chimera/src/anatomy/human.rs
++++ b/crates/chimera/src/anatomy/human.rs
+@@ -1412,31 +1412,60 @@ struct Projection {
+ }
+ 
+ /// Project a point onto a polyline: arc position, distance, and the side (cross<0 = airway side).
++///
++/// Bit-exact with the plain one-pass search (first segment with the smallest `hypot`), but much
++/// cheaper: it runs for every ray of every control step, and a divide and a `hypot` per segment
++/// cost the MPC's Cortex-A17 ~30 and ~150 cycles. The segment parameter is divided out only when
++/// it falls inside the segment (clamping gives the same t); a first pass finds the smallest
++/// squared distance, and the second computes `hypot` only for segments within rounding of it
++/// (any segment the plain search could pick is among them), in the same order.
+ fn project_on(pl: &Polyline, cum: &[f64], px: f64, py: f64) -> Projection {
+-    let mut best = f64::INFINITY;
+-    let (mut bs, mut bx, mut by, mut sign, mut bseg) = (0.0, 0.0, 0.0, 1.0, 0usize);
+-    for i in 0..pl.xs.len().saturating_sub(1) {
++    #[inline(always)]
++    fn foot(pl: &Polyline, i: usize, px: f64, py: f64) -> Option<(f64, f64, f64, f64, f64, f64, f64)> {
+         let (ax, ay) = (pl.xs[i], pl.ys[i]);
+         let (ex, ey) = (pl.xs[i + 1] - ax, pl.ys[i + 1] - ay);
+         let l2 = ex * ex + ey * ey;
+         if l2 < 1e-12 {
+-            continue;
++            return None;
+         }
+-        let mut t = ((px - ax) * ex + (py - ay) * ey) / l2;
+-        t = if t < 0.0 {
++        let dot = (px - ax) * ex + (py - ay) * ey;
++        let t = if dot <= 0.0 {
+             0.0
+-        } else if t > 1.0 {
++        } else if dot >= l2 {
+             1.0
+         } else {
+-            t
++            dot / l2
+         };
+         let (qx, qy) = (ax + ex * t, ay + ey * t);
++        Some((t, l2, qx, qy, ex, ey, (px - qx) * (px - qx) + (py - qy) * (py - qy)))
++    }
++    let segs = pl.xs.len().saturating_sub(1);
++    let mut min2 = f64::INFINITY;
++    let mut any_nan = false;
++    for i in 0..segs {
++        if let Some(f) = foot(pl, i, px, py) {
++            if f.6 < min2 {
++                min2 = f.6;
++            }
++            any_nan |= f.6.is_nan();
++        }
++    }
++    // a NaN point compares false everywhere: keep every segment, as the plain search does
++    let bound = if any_nan { f64::INFINITY } else { min2 * (1.0 + 1e-9) };
++    let mut best = f64::INFINITY;
++    let (mut bs, mut bx, mut by, mut sign, mut bseg) = (0.0, 0.0, 0.0, 1.0, 0usize);
++    for i in 0..segs {
++        let Some((t, l2, qx, qy, ex, ey, d2)) = foot(pl, i, px, py) else { continue };
++        if d2 > bound {
++            continue;
++        }
+         let d = hypot(px - qx, py - qy);
+         if d < best {
+             best = d;
+             bs = cum[i] + t * sqrt(l2);
+             bx = qx;
+             by = qy;
++            let (ax, ay) = (pl.xs[i], pl.ys[i]);
+             let cross = ex * (py - ay) - ey * (px - ax);
+             sign = if cross < 0.0 { 1.0 } else { -1.0 };
+             bseg = i;
+@@ -1466,13 +1495,14 @@ fn signed_gap(pl: &Polyline, px: f64, py: f64) -> f64 {
+         let (ax, ay, bx, by) = (xs[i], ys[i], xs[i + 1], ys[i + 1]);
+         let (ex, ey) = (bx - ax, by - ay);
+         let l2 = ex * ex + ey * ey;
+-        let mut t = if l2 > 1e-12 { ((px - ax) * ex + (py - ay) * ey) / l2 } else { 0.0 };
+-        t = if t < 0.0 {
++        // as dividing then clamping, without the divide when it would clamp (see `project_on`)
++        let dot = (px - ax) * ex + (py - ay) * ey;
++        let t = if l2 <= 1e-12 || dot <= 0.0 {
+             0.0
+-        } else if t > 1.0 {
++        } else if dot >= l2 {
+             1.0
+         } else {
+-            t
++            dot / l2
+         };
+         let (dx, dy) = (px - ax - ex * t, py - ay - ey * t);
+         let d2 = dx * dx + dy * dy;
+diff --git a/crates/chimera/src/voice/human_airway.rs b/crates/chimera/src/voice/human_airway.rs
+index 5487dcc..6674575 100644
+--- a/crates/chimera/src/voice/human_airway.rs
++++ b/crates/chimera/src/voice/human_airway.rs
+@@ -99,6 +99,14 @@ pub struct HumanAirway {
+     base: Option<[Vec<f64>; 4]>,
+     base_dt: f64,
+     noise_list: Vec<NoiseSpec>,
++    /// Skip the tract geometry while no articulator has moved more than this (cm, or the
++    /// articulator's own unit) since the frame last computed, reusing that frame's areas. 0 (the
++    /// default) always computes. A slow CPU's host sets ~1e-4: a held vowel then costs no
++    /// geometry, and its still areas let the network skip its per-sample geometry too.
++    pub still_tolerance: f64,
++    computed_at: Option<[f64; crate::anatomy::human::N_ARTIC]>,
++    /// the last computed areas were held back by the rate limits (still on their way)
++    slewing: bool,
+     scratch_frame: HumanFrame,
+ }
+ 
+@@ -200,6 +208,9 @@ impl HumanAirway {
+             base: None,
+             base_dt: 0.0,
+             noise_list: Vec::with_capacity(8),
++            still_tolerance: 0.0,
++            computed_at: None,
++            slewing: false,
+             scratch_frame: HumanFrame::with_capacity(),
+         }
+     }
+@@ -232,6 +243,26 @@ impl HumanAirway {
+ 
+     fn commit(&mut self, a: &HumanArtic, dt: f64) -> &HumanFrame {
+         // compute into the frame kept from last time (its buffers are reused)
++        let x = a.to_array();
++        if self.still_tolerance > 0.0
++            && self.frame.is_some()
++            && !self.slewing
++            && let Some(at) = &self.computed_at
++            && at.iter().zip(x.iter()).all(|(p, q)| (p - q).abs() < self.still_tolerance)
++        {
++            // nothing has moved: the last frame and its (already rate-limited) areas stand
++            let f = self.frame.take().unwrap();
++            let (ph_sim, or_sim) = (js_max(self.ph_len, self.n_ph as f64 * self.dx_stable), js_max(self.or_len, self.n_or as f64 * self.dx_stable));
++            self.net.set_tube_targets(self.pharynx, &self.ph_areas, Some(ph_sim), Some(&self.ph_min));
++            self.net.set_tube_targets(self.oral, &self.or_areas, Some(or_sim), Some(&self.or_min));
++            self.net.set_port_target(self.velum_port, f.velum_port);
++            self.update_noise(&f);
++            self.frame = Some(f);
++            return self.frame.as_ref().unwrap();
++        }
++        if self.still_tolerance > 0.0 {
++            self.computed_at = Some(x);
++        }
+         let mut f = self.frame.take().unwrap_or_else(|| core::mem::take(&mut self.scratch_frame));
+         self.tract.compute(a, &mut f);
+         let (ph_len, or_len) = self.tract.resample(a, &f, &mut self.ph_areas, &mut self.or_areas, Some(&mut self.ph_min), Some(&mut self.or_min));
+@@ -269,18 +300,21 @@ impl HumanAirway {
+             let lip_r = self.lip_open_rate * k2;
+             // opening rate of section i at area A: the sections ahead of the teeth are the lips'
+             let open_rate = |i: usize, lips_from: usize, area: f64| -> f64 { if i < lips_from { open_r } else { lip_r + (open_r - lip_r) * smooth(lo, 2.0 * lo, area) } };
+-            let clamp_arr = |cur: &mut [f64], old: &[f64], mins: &mut [f64], old_mins: &[f64], lips_from: usize| {
++            let clamp_arr = |cur: &mut [f64], old: &[f64], mins: &mut [f64], old_mins: &[f64], lips_from: usize| -> bool {
++                let mut held = false;
+                 for i in 0..cur.len() {
+                     let d = cur[i] - old[i];
+                     if d > 0.0 {
+                         let lim = (open_rate(i, lips_from, old[i]) + gain * cur[i]) * dt;
+                         if d > lim {
+                             cur[i] = old[i] + lim;
++                            held = true;
+                         }
+                     } else {
+                         let lim = (close_r(old[i]) + gain * old[i]) * dt;
+                         if d < -lim {
+                             cur[i] = old[i] - lim;
++                            held = true;
+                         }
+                     }
+                     let dm = mins[i] - old_mins[i];
+@@ -288,11 +322,13 @@ impl HumanAirway {
+                         let lim_m = (open_rate(i, lips_from, old_mins[i]) + gain * mins[i]) * dt;
+                         if dm > lim_m {
+                             mins[i] = old_mins[i] + lim_m;
++                            held = true;
+                         }
+                     } else {
+                         let lim_m = (close_r(old_mins[i]) + gain * old_mins[i]) * dt;
+                         if dm < -lim_m {
+                             mins[i] = old_mins[i] - lim_m;
++                            held = true;
+                         }
+                     }
+                     if mins[i] > cur[i] {
+@@ -302,10 +338,14 @@ impl HumanAirway {
+                         mins[i] = 0.0;
+                     }
+                 }
++                held
+             };
+-            clamp_arr(&mut self.ph_areas, &base[0], &mut self.ph_min, &base[2], usize::MAX);
++            let held_ph = clamp_arr(&mut self.ph_areas, &base[0], &mut self.ph_min, &base[2], usize::MAX);
+             let lips_from = (self.or_areas.len() as f64 * (1.0 - (f.lip_s - f.teeth_s) / or_len)) as usize;
+-            clamp_arr(&mut self.or_areas, &base[1], &mut self.or_min, &base[3], lips_from);
++            let held_or = clamp_arr(&mut self.or_areas, &base[1], &mut self.or_min, &base[3], lips_from);
++            self.slewing = held_ph || held_or;
++        } else {
++            self.slewing = dt > 0.0;
+         }
+         // A pose past the expected extremes (the tongue pressed into the floor of the mouth moves
+         // the pharynx/oral split forward: issue #50, a 5.3 cm oral tube) made sections shorter than
+diff --git a/crates/chimera/src/voice/human_voice.rs b/crates/chimera/src/voice/human_voice.rs
+index d38fee5..9c65acd 100644
+--- a/crates/chimera/src/voice/human_voice.rs
++++ b/crates/chimera/src/voice/human_voice.rs
+@@ -207,6 +207,11 @@ pub struct HumanVoice {
+     lim_release: f64,
+     /// tissue may compress this far (cm) before the palate stops the articulator
+     pub max_penetration: f64,
++    /// multiplies every pitch target (a host's transpose and pitch bend); 1 leaves the voice as is
++    pub pitch_ratio: f64,
++    /// accumulate the visualisation telemetry (tract pressure RMS, glottal scope); a host with no
++    /// display turns it off to save the work
++    pub telemetry: bool,
+ }
+ 
+ /// How many times the airway is oversampled at this output rate: the smallest factor that puts
+@@ -271,6 +276,8 @@ impl HumanVoice {
+             lim_hold_n: crate::math::js_round(0.025 * fs_out) as i64,
+             lim_release: exp(-1.0 / (0.2 * fs_out)),
+             max_penetration: 0.1,
++            pitch_ratio: 1.0,
++            telemetry: true,
+         };
+         let x = v.artic.x;
+         v.airway.apply(&x, 0.0);
+@@ -307,6 +314,13 @@ impl HumanVoice {
+         self.apply_source();
+     }
+ 
++    /// Run the control step (articulators, geometry, breath, pitch) every `out_samples` output
++    /// samples instead of every 64. Fewer steps cost less on a slow CPU; the airway still ramps
++    /// sample by sample in between.
++    pub fn set_control_interval(&mut self, out_samples: usize) {
++        self.ctrl_every = out_samples.max(16) * self.m;
++    }
++
+     /// Add gestures (times on the voice clock).
+     pub fn schedule(&mut self, gestures: &[Gesture]) {
+         self.score.add_all(gestures);
+@@ -424,6 +438,9 @@ impl HumanVoice {
+                     *o = v as f32;
+                     self.out_acc += v * v;
+                     self.out_count += 1;
++                    if !self.telemetry {
++                        continue;
++                    }
+                     // glottal scope at output rate
+                     self.scope_area[self.scope_pos] = a as f32;
+                     self.scope_flow[self.scope_pos] = net.u[gp] as f32;
+@@ -435,6 +452,9 @@ impl HumanVoice {
+                     self.last_phase = ph;
+                     self.scope_pos = (self.scope_pos + 1) % SCOPE_LEN;
+                 }
++                if !self.telemetry {
++                    continue;
++                }
+                 // decimated RMS accumulation for the pressure visualisation
+                 self.sub = self.sub.wrapping_add(1);
+                 if self.sub & 3 == 0 {
+@@ -539,7 +559,7 @@ impl HumanVoice {
+         self.glottis.params.effort = effort_at(self.source.pressure * self.gate);
+         // pitch glide
+         let g = js_max(0.002, if self.score_f0.is_some() { 0.03 } else { self.source.glide });
+-        self.f0 *= pow(f0_target / self.f0, 1.0 - exp(-dt / g));
++        self.f0 *= pow(f0_target * self.pitch_ratio / self.f0, 1.0 - exp(-dt / g));
+         self.glottis.params.f0 = self.f0;
+         // smoothed mean flow per tract node (for particle speeds)
+         let a = 1.0 - exp(-dt / 0.03);

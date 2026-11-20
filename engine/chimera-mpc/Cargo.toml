@@ -1,0 +1,15 @@
+[package]
+name = "chimera-mpc"
+description = "CHIMERA as a standalone Akai MPC instrument: the live singing controller, lyrics loading and a real-time C ABI for the MPC SDK's VST2 shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+chimera = { path = "../chimera" }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+serde_json = "1"

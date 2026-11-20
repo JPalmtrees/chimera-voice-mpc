@@ -1,0 +1,83 @@
+{
+  "kit": "mpc-red",
+  "qlinkGroups": "rows",
+  "pages": [
+    {
+      "name": "VOICE",
+      "controls": [
+        {
+          "param": "Voice",
+          "widget": "switch"
+        },
+        {
+          "param": "Breath",
+          "widget": "knob"
+        },
+        {
+          "param": "Breathy",
+          "widget": "knob"
+        },
+        {
+          "param": "Volume",
+          "widget": "knob"
+        },
+        {
+          "param": "Pressed",
+          "widget": "knob"
+        },
+        {
+          "param": "Bright",
+          "widget": "knob"
+        },
+        {
+          "param": "Rough",
+          "widget": "knob"
+        },
+        {
+          "param": "Ring",
+          "widget": "knob"
+        },
+        {
+          "param": "Vibrato",
+          "widget": "knob"
+        },
+        {
+          "param": "Vib Rate",
+          "widget": "knob"
+        },
+        {
+          "param": "Vel Sens",
+          "widget": "knob"
+        },
+        {
+          "param": "Quality",
+          "widget": "switch"
+        },
+        {
+          "param": "Transpose",
+          "widget": "knob",
+          "polarity": "bipolar"
+        },
+        {
+          "param": "Fine",
+          "widget": "knob",
+          "polarity": "bipolar"
+        },
+        {
+          "param": "Bend Rng",
+          "widget": "knob"
+        },
+        {
+          "param": "CPU",
+          "widget": "knob"
+        }
+      ]
+    }
+  ],
+  "style": {
+    "background": "ff1e1d1e",
+    "accent": "ffd31145",
+    "text": "ffffffff",
+    "muted": "ff6a6a6c"
+  }
+}
