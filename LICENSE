@@ -34,3 +34,7 @@ whose copyright notices are kept in licenses/ and THIRD_PARTY_NOTICES.md:
 "MPC" and "Akai Professional" are trademarks of inMusic Brands, Inc. "VST" is a trademark of
 Steinberg Media Technologies GmbH. This is an independent project, not affiliated with or endorsed
 by inMusic Brands, Akai Professional, Steinberg or the CHIMERA project.
+
+The diffs in patches/ change files of those upstream projects. Those files remain under their
+original copyright and license; the changes are contributed under the same MIT terms. This
+copyright line does not claim the upstream code.

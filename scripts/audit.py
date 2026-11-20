@@ -3,8 +3,8 @@
 
     python scripts/audit.py
 
-Flags likely secrets, e-mail addresses, machine-specific paths, AI-session artefacts and files
-over 2 MB. Every hit is reported for a human to judge; exit code 1 if anything is found outside
+Flags likely secrets, e-mail addresses, machine-specific paths, AI-session artefacts, unresolved
+placeholders and files over 2 MB. Every hit is reported for a human to judge; exit code 1 if anything is found outside
 the allow-list below (expected, reviewed matches).
 """
 import os
@@ -18,13 +18,13 @@ PATTERNS = {
     "email": re.compile(r"[\w.+-]+@[\w-]+\.[a-z]{2,}(?:\.[a-z]{2,})?", re.I),
     "path": re.compile(r"(?i)(c:[\\/]+users|/users/[a-z]|/home/[a-z]|\badministrator\b|mpc-development)"),
     "ai-log": re.compile(r"(?i)(\.jsonl\b|conversation log|session transcript)"),
+    "placeholder": re.compile(r"\bYOUR-[A-Z-]+|\bTODO\b|\bFIXME\b"),
 }
-# reviewed, expected matches: (pattern kind, file suffix, matched text)
+# reviewed, expected matches: (pattern kind, matched text)
 ALLOW = {
-    ("ai-log", ".jsonl"),          # the .gitignore entry and this script
+    ("ai-log", ".jsonl"),          # the .gitignore entry
     ("path", "Administrator"),     # docs explaining the Rust registry path inside the released binaries
     ("path", "C:\\Users"),
-    ("path", "c:[\\/]+users"),
 }
 SKIP_DIRS = {".git", "external", "__pycache__"}
 

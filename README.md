@@ -189,8 +189,9 @@ See [docs/testing.md](docs/testing.md).
   shown.
 - **VOWEL, SPEAK and BEATBOX** are shown on the PLAY page but are not implemented yet.
 - There is one voice at a time (monophonic), and only ASCII can be typed on the keyboard.
-- The plugin's description inside the released package still has the SDK template's text
-  ("a 4-voice synth…"). This is cosmetic, and is left as tested.
+- The released package's description still has the SDK template's text ("a 4-voice synth…
+  Describe your plugin here."). This is cosmetic and left as tested; see
+  [docs/known-issues.md](docs/known-issues.md).
 - This is an independent project, not endorsed by Akai Professional or inMusic.
 
 ## Attribution

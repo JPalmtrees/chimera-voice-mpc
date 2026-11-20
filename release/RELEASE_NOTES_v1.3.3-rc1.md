@@ -51,7 +51,7 @@ Windows: `certutil -hashfile chimera-voice-1.3.3-rc1-mpc.zip SHA256`. macOS / Li
 `shasum -a 256 chimera-voice-1.3.3-rc1-mpc.zip`.
 
 Rebuilt from this tag's sources, the zip comes out byte-identical to this asset, except for its
-`README.md` (see docs/building.md).
+`README.md` (see [docs/building.md](https://github.com/JPalmtrees/chimera-voice-mpc/blob/main/docs/building.md)).
 
 ## Known limitations
 
@@ -59,5 +59,8 @@ Rebuilt from this tag's sources, the zip comes out byte-identical to this asset,
 - The animation shows the nearest of 32 poses, with no blending, at most 12.5 changes a second.
   The larynx height is not shown.
 - The voice is monophonic. The keyboard types ASCII only.
-- The package's plugin description still has the SDK template text ("a 4-voice synth…"). This
-  is cosmetic.
+- **Cosmetic:** the package's description (`plugin.json`, `INSTALL.txt`) still has the SDK
+  template text "Chimera Voice: a 4-voice synth for the MPC. Describe your plugin here." It has no
+  effect on loading or sound (the voice is monophonic). It will be corrected in the next build, not
+  in this hardware-tested zip. See
+  [docs/known-issues.md](https://github.com/JPalmtrees/chimera-voice-mpc/blob/main/docs/known-issues.md).
