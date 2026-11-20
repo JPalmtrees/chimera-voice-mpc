@@ -44,37 +44,21 @@ Download it from the [Releases](../../releases) page.
 - **Save-state and preset compatibility.** Parameters are only ever appended; projects from
   earlier versions load with their settings and lyrics.
 
-## Engineering highlights
+## ## Engineering highlights
 
-These are the problems that shaped the design. [docs/development-history.md](docs/development-history.md)
-has the full sequence, and [docs/architecture.md](docs/architecture.md) the details.
+CHIMERA Voice required adapting a computationally intensive physical-modeling synthesizer to the hardware, performance constraints, and interface limitations of a standalone Akai MPC. The following engineering challenges shaped the project. See [Development History](docs/development-history.md) and [Architecture](docs/architecture.md) for technical details.
 
-- **A 2017-era ARM CPU running a 2026 desktop simulation.** CHIMERA simulates the airway sample by
-  sample. The first MPC build used about 52% of the MPC One's audio budget in Eco and crackled. The
-  fixes kept the sound: Newton-step replacements for per-sample divides and square roots (about
-  124 down to about 5 per sample on a test phrase, within 1e-5 of the exact output), bit-exact
-  pruning of the geometry searches, and a separate Lite model at 3/4 rate (about 35% cheaper than
-  Eco on a desktop). On the MPC One, Lite peaks around 50%.
-- **Nothing slow on the audio thread.** Notes are planned on a separate thread and reach the
-  audio thread through wait-free queues; voices are rebuilt off the audio thread and swapped in;
-  a test counts heap allocations during rendering and requires zero.
-- **The host's screen is expensive.** An early build refreshed six on-screen values at every note
-  from the audio callback. It was removed after a stutter report, which later turned out to be a
-  MIDI controller's arpeggiator. The design that shipped refreshes only on deliberate actions, or
-  when the sung syllable changes, at most 5 times a second, with a switch to turn it off. Tests
-  record every host call made from inside the audio callback.
-- **Working within a skin system that can't draw.** MPC skins show images, labels and film-strip
-  frames; they can't draw lines or blend. The animated head is therefore a pose atlas: the plugin
-  sang a corpus offline, recorded its articulators and clustered them into 32 poses per body, each
-  drawn with CHIMERA's own anatomy. Live, a lock-free snapshot of the articulators is matched to
-  the nearest pose.
-- **Undocumented host behaviour, found on hardware.** On the MPC, a "Show" item is always drawn,
-  a text label bound to no parameter is invisible, a label over a button takes its taps, and
-  parameter text is cut at 31 bytes. Each was diagnosed from hardware reports and is now checked
-  by an automated test of the generated skin.
-- **Reproducible, verifiable releases.** Every hardware-tested build has a tag and a SHA-256.
-  This repository pins the exact upstream commits the release was built from, and its sources
-  are byte-identical to the tested ones.
+- **Optimizing physical modeling for embedded ARM hardware.** CHIMERA performs computationally intensive vocal-tract simulations at audio rates. Performance optimizations reduced expensive per-sample mathematical operations, including approximately 124 divisions and square roots to 5 in a representative test. Geometry-search optimizations preserved numerical accuracy, while a dedicated Lite quality mode reduced processing requirements by approximately 35% compared with Eco in desktop benchmarks. On the original MPC One, Lite typically peaks around 50% on the device's CPU meter.
+
+- **Protecting real-time audio processing.** Computationally expensive operations are kept outside the audio callback. Note planning runs on a separate thread, with wait-free queues communicating events to the audio engine. Voice rebuilding also occurs outside the audio thread. Automated tests verify zero heap allocations during audio rendering.
+
+- **Efficient host UI synchronization.** The MPC's display system requires careful management of host notifications. Early implementations updated multiple interface values on each MIDI note. The final architecture separates visual updates from audio rendering, using event-driven notifications and rate-limited lyric highlighting at up to 5 updates per second. Automated tests verify that host UI notifications are not issued from the audio callback.
+
+- **Anatomical animation within a constrained rendering system.** The MPC skin framework cannot dynamically render or interpolate vocal-tract geometry. To reproduce CHIMERA's original visualization, the project captures real articulator states, generates 32 representative anatomical poses per voice, and selects poses using lock-free articulation snapshots. The resulting tongue, jaw, lip, and soft-palate animation follows the synthesized voice at a maximum of approximately 12.5 pose changes per second.
+
+- **Hardware-driven debugging and regression testing.** Physical MPC testing exposed undocumented skin behaviors, including unconditional rendering of certain UI elements and limited text-label capacity. These findings informed the touchscreen keyboard, lyric editor, and navigation design. Regression tests now validate the generated interface against these hardware-specific constraints.
+
+- **Reproducible builds and verified releases.** Hardware-tested versions are preserved using Git tags, SHA-256 checksums, and archived release packages. A clean checkout of the public repository retrieves pinned upstream dependencies and reproduces the tested ARM binaries, skin, and image assets. Automated Rust tests, plugin validation, host simulation, and physical MPC testing support release verification.
 
 ## Architecture
 
